@@ -230,6 +230,19 @@ def main():
     parser.add_argument("--episodes-per-update", type=int, default=8)
     parser.add_argument("--duration", type=float, default=30)
     parser.add_argument("--dimension", type=int, default=2)
+    parser.add_argument("--measurement-time", type=float, default=1)
+    parser.add_argument("--latency", type=float, default=1)
+    parser.add_argument("--batch-max", type=int, default=8)
+    parser.add_argument("--notebook-size", type=int, default=20)
+    parser.add_argument("--step-max", type=float)
+    parser.add_argument("--condition", type=float, default=10)
+    parser.add_argument("--spread", type=float, default=1)
+    parser.add_argument("--curvature-jitter", type=float, default=0)
+    parser.add_argument("--quartic-strength", type=float, default=0)
+    parser.add_argument("--no-score", action="store_true", help="disable score actions")
+    parser.add_argument(
+        "--unit-directions", action="store_true", help="normalize measured directions"
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     parser.add_argument("--threads", type=int, default=1)
@@ -263,7 +276,21 @@ def main():
     np.random.seed(args.seed)
     random.seed(args.seed)
     device = args.device
-    config = Config(dimension=args.dimension, duration=args.duration)
+    config = Config(
+        dimension=args.dimension,
+        duration=args.duration,
+        measurement_time=args.measurement_time,
+        latency=args.latency,
+        batch_max=args.batch_max,
+        notebook_size=args.notebook_size,
+        step_max=args.step_max,
+        condition=args.condition,
+        spread=args.spread,
+        curvature_jitter=args.curvature_jitter,
+        quartic_strength=args.quartic_strength,
+        score_enabled=not args.no_score,
+        unit_directions=args.unit_directions,
+    )
     start_iteration, next_seed = 0, args.seed
     if args.resume or args.evaluate:
         model, config, checkpoint = load_checkpoint(args.resume or args.evaluate, device)

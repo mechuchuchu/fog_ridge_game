@@ -5,7 +5,16 @@ import pytest
 import torch
 
 from fog_ridge import Action, Config
-from fog_ridge.mappo import MAPPO, TEAM_KINDS, collect_team, imitate_team, pack_team
+from fog_ridge.mappo import (
+    MAPPO,
+    TEAM_KINDS,
+    central_state,
+    collect_team,
+    decode_team,
+    imitate_team,
+    pack_team,
+)
+from fog_ridge.policy import KINDS
 from fog_ridge.team import TeamEnv
 
 
@@ -205,6 +214,34 @@ def test_simultaneous_measurement_and_snapshot_queue_requires_two_evictions():
     take(env, 0, "delete", slots=(0,))
     assert env.agents[0].records[0].kind == "snapshot"
     assert env.agents[0].pending is None and not env.deliveries[0]
+
+
+def test_departure_archives_position_and_makes_it_a_walk_target():
+    env = TeamEnv(Config(duration=10, notebook_size=2), 2, heterogeneous=False)
+    env.agents[1].position += np.array([2.0, -1.0])
+    archived_position = env.agents[1].position.copy()
+    env._depart(1)
+
+    assert not env.alive[1] and env.stats["departures"] == 1
+    np.testing.assert_array_equal(env.archives[0].position, archived_position)
+    assert not env.target_mask(0, "request")[1]
+
+    model = MAPPO(capacity=4, batch_max=8, width=16)
+    data = pack_team(env, 0, model.settings["capacity"])
+    assert data["valid"][0, 0] and not data["manageable"][0, 0]
+    assert data["legal"][0, KINDS.index("walk")]
+    sample = torch.zeros(9)
+    sample[0] = TEAM_KINDS.index("walk")
+    sample[3] = 0  # The archive is the first virtual position token.
+    action = decode_team(env, 0, sample)
+    np.testing.assert_allclose(action.displacement, [2.0, -1.0])
+
+    visible_state = central_state(env, 0)
+    env.archives_visible = False
+    hidden = pack_team(env, 0, model.settings["capacity"])
+    assert not hidden["valid"].any()
+    assert not hidden["legal"][0, KINDS.index("walk")]
+    assert not torch.equal(visible_state, central_state(env, 0))
 
 
 @pytest.mark.parametrize("seed", range(8))

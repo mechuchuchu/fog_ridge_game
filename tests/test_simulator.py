@@ -21,6 +21,42 @@ def test_closed_form_matches_direct_ensemble(dimension):
     assert finite_diff == pytest.approx(-direction @ probe, rel=1e-7)
 
 
+def test_perturbed_quartic_ensemble_has_consistent_score_and_gradient():
+    world = Landscape.generate(
+        np.random.default_rng(17),
+        dimension=8,
+        condition=20,
+        spread=2,
+        curvature_jitter=0.1,
+        quartic_strength=0.2,
+        quartic_scale=10,
+    )
+    x = np.random.default_rng(18).normal(size=8)
+    value, direction = world.measure(x, np.arange(100))
+    probe = np.random.default_rng(19).normal(size=8)
+    h = 1e-5
+    finite_diff = (world.score(x + h * probe) - world.score(x - h * probe)) / (2 * h)
+    assert value == pytest.approx(world.score(x))
+    assert finite_diff == pytest.approx(-direction @ probe, rel=1e-7)
+    assert world.gap(world.center) == pytest.approx(0, abs=1e-10)
+    assert world.gap(x) >= 0
+
+
+def test_score_and_unit_direction_ablations():
+    env = SoloEnv(Config(duration=3, score_enabled=False, unit_directions=True), seed=7)
+    assert not env.action_mask()["score"]
+    policy = DecayingSGD(score_every=1)
+    for _ in range(5):
+        if env.done:
+            break
+        action = policy.act(env.observe(), env.compose_walk)
+        assert action.kind != "score"
+        env.step(action)
+    env = SoloEnv(Config(duration=3, unit_directions=True), seed=7)
+    env.step(Action("measure"))
+    assert np.linalg.norm(env.last_direction) == pytest.approx(1.0)
+
+
 def test_same_map_remeasurement_and_score_privacy():
     env = SoloEnv()
     env.step(Action("measure"))

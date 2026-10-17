@@ -25,7 +25,9 @@ class DecayingSGD:
             slot = int(candidates[0]) if len(candidates) else int(np.argmax(records[:, 8]))
             return Action("delete", slots=(slot,))
         if self.phase == "walk":
-            self.phase = "score" if (self.steps + 1) % self.score_every == 0 else "measure"
+            self.phase = (
+                "score" if mask["score"] and (self.steps + 1) % self.score_every == 0 else "measure"
+            )
             weights = np.zeros(len(records))
             candidates = np.flatnonzero(records[:, 0] == 1)
             if not len(candidates):

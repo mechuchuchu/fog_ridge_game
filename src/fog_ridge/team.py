@@ -28,6 +28,16 @@ class Session:
     snapshots: tuple | None = None
 
 
+@dataclass
+class Archive:
+    player: int
+    time: float
+    position: np.ndarray
+    dashboard: float | None
+    measurement_time: float
+    latency: float
+
+
 class TeamEnv:
     """Local effects commit at completion; communication never exposes future copies."""
 
@@ -40,6 +50,8 @@ class TeamEnv:
         heterogeneous=True,
         communication=True,
         request_timeout=5.0,
+        dropout_mean=None,
+        archives_visible=True,
     ):
         config = Config() if config is None else config
         if not isinstance(players, int) or players < 1:
@@ -48,11 +60,21 @@ class TeamEnv:
             raise ValueError("aggregation must be min or mean")
         if not np.isfinite(request_timeout) or request_timeout <= 0:
             raise ValueError("request_timeout must be positive")
+        if dropout_mean is not None and (not np.isfinite(dropout_mean) or dropout_mean <= 0):
+            raise ValueError("dropout_mean must be positive when enabled")
         self.config, self.aggregation = config, aggregation
         self.communication, self.request_timeout = communication, request_timeout
+        self.dropout_mean = dropout_mean
+        self.archives_visible = archives_visible
         self.time, self.done = 0.0, False
         self.agents = [SoloEnv(config, seed) for _ in range(players)]
         rng = np.random.default_rng(np.random.SeedSequence([seed, 8191]))
+        self.alive = [True] * players
+        self.archives = []
+        self.departure_events = []
+        self.departure_times = (
+            rng.exponential(dropout_mean, size=players) if dropout_mean is not None else None
+        )
         self.futures, self.requests, self.sessions, self.links = {}, {}, {}, {}
         self.deliveries = [deque() for _ in self.agents]
         self.ready = deque(range(players))
@@ -71,6 +93,7 @@ class TeamEnv:
                 "score_cancelled",
                 "snapshots",
                 "overlap_measurements",
+                "departures",
             ),
             0,
         )
@@ -107,7 +130,7 @@ class TeamEnv:
         return self.sessions.get(self.links.get(player))
 
     def _wake(self, player, reason=""):
-        if player not in self.ready and not self.done:
+        if self.alive[player] and player not in self.ready and not self.done:
             self.ready.append(player)
         if reason:
             self.last_result[player] = reason
@@ -115,7 +138,7 @@ class TeamEnv:
     def action_mask(self, player):
         local = self.agents[player]
         mask = local.action_mask() | dict.fromkeys(COMM_KINDS, False)
-        if self.done:
+        if self.done or not self.alive[player]:
             return dict.fromkeys(mask, False)
         busy = player in self.futures
         if busy:
@@ -130,7 +153,7 @@ class TeamEnv:
         if self.communication:
             received = self.incoming(player)
             mask["request"] = (
-                not linked and not busy and self.outgoing(player) is None and len(self.agents) > 1
+                not linked and not busy and self.outgoing(player) is None and sum(self.alive) > 1
             )
             mask["accept"] = bool(received) and not linked
             mask["reject"] = bool(received)
@@ -147,7 +170,7 @@ class TeamEnv:
     def target_mask(self, player, kind):
         if kind == "request":
             # Other players' communication busy status is deliberately private.
-            return np.arange(len(self.agents)) != player
+            return np.array([i != player and self.alive[i] for i in range(len(self.agents))])
         received = self.incoming(player)
         return np.array(
             [
@@ -236,6 +259,44 @@ class TeamEnv:
         for i in (session.a, session.b):
             self._wake(i, "session_end" if deliver else "disconnect")
 
+    def _depart(self, player):
+        """Freeze a player at its last completed walk and publish its archive entry."""
+        if not self.alive[player]:
+            return
+        local = self.agents[player]
+        self.archives.append(
+            Archive(
+                player,
+                self.time,
+                local.position.copy(),
+                local.dashboard,
+                local.config.measurement_time,
+                local.config.latency,
+            )
+        )
+        self.alive[player] = False
+        local.done = True
+        self.futures.pop(player, None)
+        self.ready = type(self.ready)(i for i in self.ready if i != player)
+        if player in self.links:
+            self._finish_session(self.links[player], False)
+        for key, request in list(self.requests.items()):
+            if player in key:
+                del self.requests[key]
+                other = request.target if request.sender == player else request.sender
+                self._wake(other, "peer_departed")
+        self.stats["departures"] += 1
+        event = {
+            "time": self.time,
+            "event": "departure",
+            "player": player,
+            "position": local.position.tolist(),
+            "gap": local.landscape.gap(local.position),
+            "potential": self.potential,
+        }
+        self.departure_events.append(event)
+        self.trace.append(event)
+
     def _respond(self, player, action):
         key = (action.target, player)
         request = self.requests[key]
@@ -293,6 +354,8 @@ class TeamEnv:
             times += [candidate.time for candidate, _ in self.futures.values()]
             times += [r.expires for r in self.requests.values()]
             times += [s.end for s in self.sessions.values() if s.start is not None]
+            if self.departure_times is not None:
+                times += [self.departure_times[i] for i, alive in enumerate(self.alive) if alive]
             event_time = min(times)
             before = self.potential
             self.time = event_time
@@ -327,6 +390,10 @@ class TeamEnv:
                     )
                     self._wake(request.sender, "expired")
                     self._wake(request.target, "expired")
+            if self.departure_times is not None:
+                for i, departure_time in enumerate(self.departure_times):
+                    if self.alive[i] and departure_time == event_time:
+                        self._depart(i)
             for agent in self.agents:
                 if agent.next_dashboard == event_time:
                     agent._publish()
@@ -341,10 +408,14 @@ class TeamEnv:
                 for agent in self.agents:
                     agent.done = True
             # If an expiry only woke a busy player this still yields a valid continue decision.
-        return None if self.done else self.ready[0]
+        if self.done:
+            return None
+        if not self.ready:
+            return self.next_agent()
+        return self.ready[0]
 
     def submit(self, player, action):
-        if self.done or not self.ready or self.ready[0] != player:
+        if self.done or not self.alive[player] or not self.ready or self.ready[0] != player:
             raise ValueError("player does not have the next decision")
         if not self.action_mask(player).get(action.kind, False):
             raise ValueError(f"illegal team action: {action.kind}")

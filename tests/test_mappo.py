@@ -77,8 +77,8 @@ def test_agent_intervals_receive_full_team_reward(aggregation):
     for report in reports:
         np.testing.assert_allclose(report["agent_rewards"], report["potential_change"], atol=1e-8)
         assert len(report["decisions"]) == 3 and min(report["decisions"]) > 0
-    assert batch["critic"].shape[1:] == (4, 14)
-    assert batch["data"]["players"].shape[1:] == (3, 10)
+    assert batch["critic"].shape[1:] == (4, 15)
+    assert batch["data"]["players"].shape[1:] == (3, 11)
     _, logps, _ = model.act(batch["data"], batch["actions"])
     torch.testing.assert_close(logps, batch["logp"], atol=1e-5, rtol=1e-5)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)

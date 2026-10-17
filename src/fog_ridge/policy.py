@@ -46,6 +46,7 @@ def pack(observation, capacity, device="cpu"):
     data = {
         "tokens": tokens,
         "valid": valid,
+        "manageable": valid.copy(),
         "pair": pair,
         "context": context,
         "legal": np.array([observation["mask"][k] for k in KINDS]),
@@ -156,7 +157,8 @@ class ActorCritic(nn.Module):
                 else distribution.sample()
             )
         kind = chosen[0]
-        management_mask = torch.where((kind == 5)[:, None], direction, valid)
+        manageable = data.get("manageable", valid)
+        management_mask = torch.where((kind == 5)[:, None], direction, manageable)
         first = categorical(logits[:, 2], management_mask)
         s1 = (
             actions[:, 4].long()

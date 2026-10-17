@@ -16,9 +16,13 @@ class Config:
     latency: float = 1.0
     batch_max: int = 8
     notebook_size: int = 20
+    score_enabled: bool = True
+    unit_directions: bool = False
     dashboard_period: float = 5.0
     condition: float = 10.0
     spread: float = 1.0
+    curvature_jitter: float = 0.0
+    quartic_strength: float = 0.0
     start_radius: float = 10.0
     step_max: float | None = None
 
@@ -42,6 +46,9 @@ class Config:
                 raise ValueError(f"{name} must be finite and positive")
         if self.condition < 1:
             raise ValueError("condition must be >= 1")
+        for name in ("curvature_jitter", "quartic_strength"):
+            if not np.isfinite(getattr(self, name)) or getattr(self, name) < 0:
+                raise ValueError(f"{name} must be finite and nonnegative")
         if self.step_max is not None and (not np.isfinite(self.step_max) or self.step_max <= 0):
             raise ValueError("step_max must be finite and positive")
 
@@ -90,7 +97,15 @@ class SoloEnv:
         world, samples = np.random.SeedSequence(seed).spawn(2)
         rng = np.random.default_rng(world)
         self.rng = np.random.default_rng(samples)
-        self.landscape = Landscape.generate(rng, config.dimension, config.condition, config.spread)
+        self.landscape = Landscape.generate(
+            rng,
+            config.dimension,
+            config.condition,
+            config.spread,
+            curvature_jitter=config.curvature_jitter,
+            quartic_strength=config.quartic_strength,
+            quartic_scale=config.start_radius,
+        )
         offset = rng.normal(size=config.dimension)
         self.position = (
             self.landscape.center + offset / np.linalg.norm(offset) * config.start_radius
@@ -117,12 +132,19 @@ class SoloEnv:
         kinds = ("measure", "score", "walk", "wait", "delete", "summarize")
         if self.done:
             return dict.fromkeys(kinds, False)
+        score_enabled = self.config.score_enabled
         can_summarize = sum(r.direction is not None for r in self.records) >= 2
         if self.pending is not None:
             return {k: k == "delete" or (k == "summarize" and can_summarize) for k in kinds}
         return {
             k: (
-                can_summarize if k == "summarize" else bool(self.records) if k == "delete" else True
+                can_summarize
+                if k == "summarize"
+                else bool(self.records)
+                if k == "delete"
+                else score_enabled
+                if k == "score"
+                else True
             )
             for k in kinds
         }
@@ -211,6 +233,10 @@ class SoloEnv:
                     self.current_map, self.rng.choice(others, action.batch - 1, replace=False)
                 ]
                 value, direction = self.landscape.measure(self.position, indices)
+                if self.config.unit_directions:
+                    norm = np.linalg.norm(direction)
+                    if norm > 0:
+                        direction = direction / norm
                 self.last_measurement = value
                 self.last_direction = direction.copy()
                 self.last_batch = action.batch

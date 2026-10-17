@@ -76,7 +76,7 @@ def test_critic_parameters_cannot_affect_actor():
             parameter.add_(100)
     after = model.act(data, deterministic=True)[0]
     torch.testing.assert_close(before, after)
-    assert set(data) == {"tokens", "valid", "pair", "context", "legal"}
+    assert set(data) == {"tokens", "valid", "manageable", "pair", "context", "legal"}
 
 
 def test_ppo_updates_parameters_and_checkpoint_roundtrip(tmp_path):

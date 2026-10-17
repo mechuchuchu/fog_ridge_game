@@ -1,6 +1,6 @@
 # 안개 능선
 
-[룰북 v0.5](fog-ridge-rulebook.md)와 [RL 설계 v0.2](fog-ridge-rl-design.md)를 구현하는 Python 연구 프로젝트다. 현재는 **솔로 PPO와 교신을 포함한 비동기 다인 MAPPO**를 구현했다. 이탈·아카이브와 GPU 환경 벡터화는 후속 단계다.
+[룰북 v0.5](fog-ridge-rulebook.md)와 [RL 설계 v0.2](fog-ridge-rl-design.md)를 구현하는 Python 연구 프로젝트다. 현재 **솔로 PPO, 교신·이탈·아카이브를 포함한 비동기 다인 MAPPO**, 비2차 맵 생성과 짝지은 평가를 지원한다.
 
 ```bash
 uv sync
@@ -12,7 +12,7 @@ uv run fog-ridge --episodes 30 --dimension 16 --duration 60 --output results/sol
 
 구현한 내용:
 
-- 100개의 이동된 2차 맵, 로그 균등 대각 곡률, 폐형식 평균 고도와 gap.
+- 100개의 이동된 맵, 로그 균등 대각 곡률, 폐형식 평균 고도와 gap. 기본은 2차 맵이며 `--curvature-jitter`와 `--quartic-strength`로 맵별 곡률 차이와 4차 항을 켤 수 있다.
 - 연속시간 측정(`B*m`), 점수계(`3m`), 걸음(`m/10`), 대기.
 - 현재 맵을 포함한 중복 없는 B장 측정. 현재 맵은 완료된 걸음에서만 다시 뽑는다. 0거리 걸음도 맵을 다시 뽑으며, 같은 맵이 다시 뽑힐 수도 있다.
 - 최대 걸음 길이 clipping, 5초 주기 대시보드, 제한 시간에 끝나지 않은 행동 폐기.
@@ -20,6 +20,7 @@ uv run fog-ridge --episodes 30 --dimension 16 --duration 60 --output results/sol
 - 좌표축을 노출하지 않는 노름·코사인 관측과 기록장 방향·위치 가중합 행동 디코더.
 - 잠재함수 `-log10(gap + 1e-12)` 차이 보상, 실제 결정 간격 `info['dt']`.
 - 관측만 사용해 행동을 고르는 감쇠 SGD, 주기적인 점수계 사용, 시드별 평가 CLI.
+- 설정 가능한 환경 ablation: 점수계 비활성화, 단위 방향, B_max, 기록장 크기, 측정 시간, 지연, 최대 보폭과 맵 비선형성.
 
 Python에서 직접 실행할 수도 있다.
 
@@ -42,7 +43,9 @@ print(result)
 
 현재 베이스라인은 학습이나 튜닝을 수행하지 않는다. B는 고정이고 학습률은 `lr / (1 + decay * steps)`다. 최고 점수계 기록을 가능한 한 보존하지만 막판 복귀는 아직 구현하지 않았다. 관측의 점수계·대시보드 값도 현재 원시값이며, 학습 단계에서 상대값 정규화를 추가해야 한다.
 
-다음 구현 단계는 교신 정책 튜닝과 커리큘럼 평가, 이탈·아카이브, GPU 텐서 병렬화다. 비2차 맵, 평가 ablation, 규칙 증류도 아직 구현하지 않았다. 솔로 테스트 통과를 전체 게임이나 커리큘럼 ①의 학습 통과로 간주하지 않는다.
+MAPPO는 `--dropout-mean`으로 독립 지수분포 이탈과 공개 아카이브를 사용할 수 있다. 이탈 시 진행 중 작업을 버리고 마지막 완료 위치를 고정하며, 살아 있는 정책은 아카이브 위치를 걸음 대상으로 선택할 수 있다. 값은 초 단위 평균이다. 예를 들어 `--duration 30 --dropout-mean 60`은 평균 이탈 시각 2T다. 기본값은 이탈 없음이다.
+
+커리큘럼 자동 평가, GPU 텐서 환경 병렬화, 전체 평가 ablation, 규칙 증류는 아직 구현하지 않았다. 솔로 테스트 통과를 전체 게임이나 커리큘럼 ①의 학습 통과로 간주하지 않는다.
 
 ```bash
 uv run ruff check src tests
@@ -87,6 +90,11 @@ PPO clip은 0.2, GAE lambda는 0.95, 기본 gamma는 1이다. gamma는 초당 �
 ```bash
 uv run fog-ridge-mappo --players 4 --aggregation min --iterations 20 --output results/mappo-min
 uv run fog-ridge-mappo --players 4 --aggregation mean --iterations 20 --output results/mappo-mean
+uv run fog-ridge-mappo --players 4 --aggregation min --iterations 20 --duration 30 --dropout-mean 120 --output results/mappo-dropout
+uv run fog-ridge-mappo --players 4 --aggregation min --iterations 20 --curvature-jitter 0.1 --quartic-strength 0.2 --output results/mappo-nonlinear
+uv run fog-ridge-mappo --players 4 --aggregation min --iterations 20 --no-score --unit-directions --batch-max 1 --output results/mappo-ablation
+uv run fog-ridge-mappo --players 4 --aggregation min --iterations 20 --dropout-mean 120 --hide-archives --output results/mappo-hidden-archives
+uv run fog-ridge-mappo --players 4 --aggregation min --iterations 20 --homogeneous --latency 2 --measurement-time 0.5 --output results/mappo-slow-link
 uv run fog-ridge-mappo --resume results/mappo-min/checkpoint.pt --iterations 20 --output results/mappo-min
 uv run fog-ridge-mappo --evaluate results/mappo-min/checkpoint.pt --eval-episodes 100 --output results/mappo-eval
 uv run fog-ridge-mappo --evaluate results/mappo-min/checkpoint.pt --no-communication --eval-episodes 100 --output results/mappo-no-comm-eval
@@ -120,13 +128,13 @@ uv run fog-ridge-mappo --evaluate results/mappo-min/checkpoint.pt --no-communica
 
 ### 출력과 제한
 
-- `checkpoint.pt`: 모델·optimizer·RNG·환경·학습 설정. 교신 모델은 별도 `communication_version=1`로 저장한다. 이전 교신 없는 MAPPO 체크포인트는 헤드와 관측 크기가 달라 새 모델로 학습을 시작해야 한다. 솔로 PPO 형식은 유지한다.
+- `checkpoint.pt`: 모델·optimizer·RNG·환경·학습 설정. 교신·아카이브 모델은 별도 `communication_version=2`로 저장한다. 이전 MAPPO 체크포인트는 관측 크기가 달라 새 모델로 학습을 시작해야 한다. 솔로 PPO 형식은 유지한다.
 - `imitation.json`: 모방 데이터 생성 중의 교신 통계.
 - `train.jsonl`: 학습 loss·KL·점수와 요청·403·수락·거절·만료·교신 시작/완료·끊기·점수계 취소·스냅샷·중첩 측정 횟수.
 - `episodes.jsonl`: 학습 rollout별 시드·플레이어 L/m·gap·결정 횟수·교신 사건 목록. 누가 누구와 언제 교신했는지 학습 중에도 분석할 수 있다.
-- `evaluation.json`: 시드별 MAPPO/SGD gap, 교신 통계와 요청·응답·세션 시작/종료 사건 목록. 세션 사건의 끝점으로 교신 그래프를 구성할 수 있다.
+- `evaluation.json`: 시드별 MAPPO/SGD gap, paired 중앙 log10-gap 차이와 95% bootstrap 구간, 교신 통계 및 요청·응답·세션 사건 목록. 세션 끝점으로 교신 그래프를 구성할 수 있다.
 - `run.json`: 실행 및 복원된 환경·학습 설정.
 
-아직 이탈·아카이브, 거짓말 변형, GRU, 여러 기록의 soft 가중합, 비2차 맵, GPU 환경 벡터화는 없다. 현재는 인원 고정 배치의 CPU 참조 환경이며 네트워크 자체는 다른 인원과 차원에서도 실행할 수 있다. 짧은 실행으로 교신이 학습 성능을 개선한다고 판단하지 않는다. 요청·403 등은 규칙대로 시간이 0이므로 정책이 이를 끝없이 반복하면 결정 횟수 상한 오류로 중단한다. 별도 cooldown이나 가짜 시간 비용을 추가하지 않는다.
+아직 거짓말 변형, GRU, 여러 기록의 soft 가중합, GPU 환경 벡터화, 커리큘럼 자동화, 자동 규칙 증류와 전체 ablation 실행기는 없다. 기본 환경 설정은 CLI로 바꿔 단일 ablation을 학습할 수 있고, `--no-communication`은 동일 시드 평가 비교를 지원한다. 현재는 인원 고정 배치의 CPU 참조 환경이며 네트워크 자체는 다른 인원과 차원에서도 실행할 수 있다. 짧은 실행으로 교신이 학습 성능을 개선한다고 판단하지 않는다. 요청·403 등은 규칙대로 시간이 0이므로 정책이 이를 끝없이 반복하면 결정 횟수 상한 오류로 중단한다. 별도 cooldown이나 가짜 시간 비용을 추가하지 않는다.
 
 MAPPO 참고: [The Surprising Effectiveness of PPO in Cooperative, Multi-Agent Games](https://arxiv.org/abs/2103.01955).

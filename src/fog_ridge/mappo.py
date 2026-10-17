@@ -19,7 +19,34 @@ TEAM_KINDS = KINDS + COMM_KINDS
 
 
 def pack_team(env, player, capacity, device="cpu"):
-    data = pack(env.agents[player].observe(), capacity, device)
+    local = env.agents[player]
+    observation = local.observe()
+    notebook_count = len(local.records)
+    archives = env.archives if env.archives_visible else []
+    if archives:
+        archive_rows = np.zeros((len(archives), 9), dtype=float)
+        archive_rows[:, 3] = [env.time - item.time for item in archives]
+        archive_rows[:, 6] = [np.linalg.norm(item.position - local.position) for item in archives]
+        observation["records"] = np.concatenate((observation["records"], archive_rows), axis=0)
+        n = len(observation["direction_cosines"])
+        cosines = np.zeros((n + len(archives), n + len(archives)))
+        cosines[:n, :n] = observation["direction_cosines"]
+        cross = np.zeros_like(cosines)
+        cross[:n, :n] = observation["direction_offset_cosines"]
+        for i, record in enumerate(local.records):
+            if record.direction is None:
+                continue
+            dn = np.linalg.norm(record.direction)
+            for j, archive in enumerate(archives):
+                offset = archive.position - local.position
+                cross[i, n + j] = float(record.direction @ offset) / max(
+                    dn * np.linalg.norm(offset), 1e-12
+                )
+        observation["direction_cosines"] = cosines
+        observation["direction_offset_cosines"] = cross
+    data = pack(observation, capacity, device)
+    if archives:
+        data["manageable"][..., notebook_count : notebook_count + len(archives)] = False
     known = [a.dashboard for a in env.agents if a.dashboard is not None]
     reference = max(min(known), 1e-12) if known else 1
     incoming = {r.sender: r for r in env.incoming(player)}
@@ -37,13 +64,14 @@ def pack_team(env, player, capacity, device="cpu"):
             float(outgoing is not None and outgoing.target == i),
             float(session is not None and i != player and i in (session.a, session.b)),
             (incoming[i].expires - env.time) / env.request_timeout if i in incoming else 0.0,
+            float(env.alive[i]),
         ]
         for i, a in enumerate(env.agents)
     ]
     data["players"] = torch.tensor(public, dtype=torch.float32, device=device).unsqueeze(0)
     mask = env.action_mask(player)
     data["legal"] = torch.tensor([[mask[k] for k in TEAM_KINDS]], device=device)
-    if not env.agents[player].records:
+    if not env.agents[player].records and not archives:
         data["legal"][0, KINDS.index("walk")] = False
     data["targets"] = torch.tensor(
         np.array([env.target_mask(player, k) for k in ("request", "accept", "reject", "ignore")]),
@@ -51,7 +79,7 @@ def pack_team(env, player, capacity, device="cpu"):
     ).unsqueeze(0)
     remaining = env.futures[player][0].time - env.time if player in env.futures else 0
     local_kind = env.futures[player][1]["action"] if player in env.futures else ""
-    local = [
+    local_context = [
         np.log1p(remaining),
         float(local_kind == "measure"),
         float(local_kind == "score"),
@@ -62,13 +90,21 @@ def pack_team(env, player, capacity, device="cpu"):
         np.log1p(max(0, session.end - env.time)) if session and session.start is not None else 0,
         float(env.last_result[player] == "403"),
     ]
-    data["communication"] = torch.tensor([local], dtype=torch.float32, device=device)
-    sources = np.zeros((capacity, 3), dtype=np.float32)
-    for i, record in enumerate(env.agents[player].records):
+    data["communication"] = torch.tensor([local_context], dtype=torch.float32, device=device)
+    sources = np.zeros((capacity, 4), dtype=np.float32)
+    for i, record in enumerate(local.records):
         sources[i] = [
             float(record.kind == "snapshot"),
             np.log1p(record.source_m),
             np.log1p(record.source_l),
+            0.0,
+        ]
+    for j, archive in enumerate(archives):
+        sources[notebook_count + j] = [
+            0.0,
+            np.log1p(archive.measurement_time),
+            np.log1p(archive.latency),
+            1.0,
         ]
     data["sources"] = torch.tensor(sources, device=device).unsqueeze(0)
     return data
@@ -79,17 +115,23 @@ def central_state(env, player, device="cpu"):
     tokens = []
     for i, agent in enumerate(env.agents):
         remaining = env.futures[i][0].time - env.time if i in env.futures else 0
+        private = privileged(agent)
+        distance = np.linalg.norm(agent.position - focal.position)
+        if not env.alive[i] and not env.archives_visible:
+            private = np.zeros_like(private)
+            distance = 0.0
         tokens.append(
             np.r_[
-                privileged(agent),
+                private,
                 np.log1p(agent.config.measurement_time),
                 np.log1p(agent.config.latency),
                 np.log1p(remaining),
-                np.log1p(np.linalg.norm(agent.position - focal.position)),
+                np.log1p(distance),
                 float(i in env.links),
                 np.log1p(max(0, env.session(i).end - env.time))
                 if env.session(i) is not None and env.session(i).start is not None
                 else 0,
+                float(env.alive[i]),
             ]
         )
     # Focal query first; following player tokens form an unordered set.
@@ -101,7 +143,7 @@ def central_state(env, player, device="cpu"):
 class CentralCritic(nn.Module):
     def __init__(self, width):
         super().__init__()
-        self.embed = nn.Sequential(nn.Linear(14, width), nn.Tanh())
+        self.embed = nn.Sequential(nn.Linear(15, width), nn.Tanh())
         self.blocks = nn.ModuleList([SetBlock(width), SetBlock(width)])
         self.head = nn.Sequential(nn.Linear(2 * width, width), nn.Tanh(), nn.Linear(width, 1))
 
@@ -118,9 +160,9 @@ class CentralCritic(nn.Module):
 class MAPPO(ActorCritic):
     def __init__(self, capacity=20, batch_max=8, width=64):
         super().__init__(capacity, batch_max, width)
-        self.public = nn.Sequential(nn.Linear(10, width), nn.Tanh(), nn.Linear(width, width))
+        self.public = nn.Sequential(nn.Linear(11, width), nn.Tanh(), nn.Linear(width, width))
         self.communication = nn.Sequential(nn.Linear(9, width), nn.Tanh())
-        self.source_embed = nn.Linear(3, width, bias=False)
+        self.source_embed = nn.Linear(4, width, bias=False)
         self.kind = nn.Linear(width, len(TEAM_KINDS))
         # Local behavior dominates before the communication curriculum/BC warm start.
         with torch.no_grad():
@@ -182,6 +224,31 @@ class MAPPO(ActorCritic):
 def decode_team(env, player, sample):
     kind = int(sample[0].item())
     if kind < len(KINDS):
+        if KINDS[kind] == "walk":
+            values = sample.detach().cpu().numpy()
+            local = env.agents[player]
+            count = len(local.records)
+            gradient_weights = np.zeros(count)
+            position_weights = np.zeros(count)
+            gradient_slot, position_slot = int(values[2]), int(values[3])
+            if count and local.records[gradient_slot].direction is not None:
+                gradient_weights[gradient_slot] = 1
+            if position_slot < count:
+                position_weights[position_slot] = 1
+                archive_position = None
+            else:
+                archive_position = env.archives[position_slot - count].position
+            displacement = local.compose_walk(
+                gradient_weights,
+                position_weights,
+                gradient_scale=float(np.exp(np.clip(values[6], -12, 4))),
+                position_scale=float(np.exp(np.clip(values[7], -12, 4))),
+            ).displacement
+            if archive_position is not None:
+                displacement += float(np.exp(np.clip(values[7], -12, 4))) * (
+                    archive_position - local.position
+                )
+            return Action("walk", displacement=displacement)
         return decode_action(env.agents[player], sample[:8])
     return Action(TEAM_KINDS[kind], target=int(sample[8].item()))
 
@@ -218,12 +285,32 @@ class GossipTeacher:
 
 
 def imitate_team(
-    model, optimizer, config, seeds, players, aggregation, device, epochs=20, communication=True
+    model,
+    optimizer,
+    config,
+    seeds,
+    players,
+    aggregation,
+    device,
+    epochs=20,
+    communication=True,
+    dropout_mean=None,
+    archives_visible=True,
+    heterogeneous=True,
 ):
     observations, targets = [], []
     totals = None
     for seed in seeds:
-        env = TeamEnv(config, players, seed, aggregation, communication=communication)
+        env = TeamEnv(
+            config,
+            players,
+            seed,
+            aggregation,
+            communication=communication,
+            dropout_mean=dropout_mean,
+            archives_visible=archives_visible,
+            heterogeneous=heterogeneous,
+        )
         teacher = GossipTeacher(env)
         for _ in range(100_000 * players):
             player = env.next_agent()
@@ -278,6 +365,9 @@ def collect_team(
     lam=0.95,
     deterministic=False,
     communication=True,
+    dropout_mean=None,
+    archives_visible=True,
+    heterogeneous=True,
 ):
     """Close a transition at this agent's next decision, not at a teammate's event."""
     data_rows, critic_rows, action_rows, logps, advantages, returns, reports = (
@@ -290,19 +380,43 @@ def collect_team(
         [],
     )
     for seed in seeds:
-        env = TeamEnv(config, players, seed, aggregation, communication=communication)
+        env = TeamEnv(
+            config,
+            players,
+            seed,
+            aggregation,
+            communication=communication,
+            dropout_mean=dropout_mean,
+            archives_visible=archives_visible,
+            heterogeneous=heterogeneous,
+        )
         trajectories = [[] for _ in env.agents]
         pending = {}
         initial = env.potential
 
-        def close(player, pending=pending, env=env, trajectories=trajectories):
+        def close(
+            player,
+            end_time=None,
+            end_potential=None,
+            pending=pending,
+            env=env,
+            trajectories=trajectories,
+        ):
             row = pending.pop(player)
-            row["reward"] = env.potential - row.pop("potential")
-            row["dt"] = env.time - row.pop("start")
+            row["reward"] = (env.potential if end_potential is None else end_potential) - row.pop(
+                "potential"
+            )
+            row["dt"] = (env.time if end_time is None else end_time) - row.pop("start")
             trajectories[player].append(row)
 
+        departure_cursor = 0
         for _ in range(100_000 * players):
             player = env.next_agent()
+            for event in env.departure_events[departure_cursor:]:
+                departed = event["player"]
+                if departed in pending:
+                    close(departed, event["time"], event["potential"])
+            departure_cursor = len(env.departure_events)
             if player is None:
                 for i in list(pending):
                     close(i)
@@ -353,6 +467,16 @@ def collect_team(
                 "decisions": [len(t) for t in trajectories],
                 "communication": dict(env.stats),
                 "communication_events": [row for row in env.trace if "event" in row],
+                "archives": [
+                    {
+                        "time": item.time,
+                        "position": item.position.tolist(),
+                        "last_dashboard": item.dashboard,
+                        "measurement_time": item.measurement_time,
+                        "latency": item.latency,
+                    }
+                    for item in env.archives
+                ],
                 "players": [
                     {"L": a.config.latency, "m": a.config.measurement_time} for a in env.agents
                 ],
@@ -368,8 +492,24 @@ def collect_team(
     }, reports
 
 
-def baseline_team(config, seed, players, aggregation):
-    env = TeamEnv(config, players, seed, aggregation)
+def baseline_team(
+    config,
+    seed,
+    players,
+    aggregation,
+    dropout_mean=None,
+    archives_visible=True,
+    heterogeneous=True,
+):
+    env = TeamEnv(
+        config,
+        players,
+        seed,
+        aggregation,
+        dropout_mean=dropout_mean,
+        archives_visible=archives_visible,
+        heterogeneous=heterogeneous,
+    )
     policies = [DecayingSGD() for _ in env.agents]
     for _ in range(100_000 * players):
         player = env.next_agent()
@@ -389,6 +529,9 @@ def evaluate_team(
     device="cpu",
     communication=True,
     deterministic=False,
+    dropout_mean=None,
+    archives_visible=True,
+    heterogeneous=True,
 ):
     results = []
     cuda_devices = [torch.cuda.current_device()] if torch.device(device).type == "cuda" else []
@@ -407,19 +550,37 @@ def evaluate_team(
                 device,
                 deterministic=deterministic,
                 communication=communication,
+                dropout_mean=dropout_mean,
+                archives_visible=archives_visible,
+                heterogeneous=heterogeneous,
             )
         results.append(
             {
                 "seed": seed,
                 "mappo_gap": reports[0]["gap"],
-                "sgd_gap": baseline_team(config, seed, players, aggregation),
+                "sgd_gap": baseline_team(
+                    config,
+                    seed,
+                    players,
+                    aggregation,
+                    dropout_mean,
+                    archives_visible,
+                    heterogeneous,
+                ),
                 "communication": reports[0]["communication"],
                 "communication_events": reports[0]["communication_events"],
             }
         )
+    paired = np.array(
+        [np.log10(row["mappo_gap"] + 1e-12) - np.log10(row["sgd_gap"] + 1e-12) for row in results]
+    )
+    rng = np.random.default_rng(90210)
+    bootstrap = np.median(paired[rng.integers(0, len(paired), size=(10_000, len(paired)))], axis=1)
     return {
         "deterministic": deterministic,
         "episodes": results,
+        "paired_median_log10_gap_delta": float(np.median(paired)),
+        "paired_median_delta_95pct_ci": np.quantile(bootstrap, [0.025, 0.975]).tolist(),
         **{
             f"{name}_median_log10_gap": float(
                 np.median([np.log10(row[f"{name}_gap"] + 1e-12) for row in results])
@@ -434,7 +595,7 @@ def load_mappo(path, device="cpu"):
     if (
         checkpoint.get("algorithm") != "mappo"
         or checkpoint["format_version"] != 1
-        or checkpoint.get("communication_version") != 1
+        or checkpoint.get("communication_version") != 2
     ):
         raise ValueError("expected a MAPPO checkpoint")
     model = MAPPO(**checkpoint["model_settings"]).to(device)
@@ -452,7 +613,7 @@ def save_mappo(path, model, optimizer, config, iteration, next_seed, training):
         next_seed,
         training,
         algorithm="mappo",
-        extra={"communication_version": 1},
+        extra={"communication_version": 2},
     )
 
 
@@ -467,6 +628,36 @@ def main():
     parser.add_argument("--episodes-per-update", type=int, default=4)
     parser.add_argument("--dimension", type=int, default=2)
     parser.add_argument("--duration", type=float, default=30)
+    parser.add_argument("--measurement-time", type=float, default=1)
+    parser.add_argument("--latency", type=float, default=1)
+    parser.add_argument("--batch-max", type=int, default=8)
+    parser.add_argument("--notebook-size", type=int, default=20)
+    parser.add_argument("--step-max", type=float)
+    parser.add_argument("--condition", type=float, default=10)
+    parser.add_argument("--spread", type=float, default=1)
+    parser.add_argument("--curvature-jitter", type=float, default=0)
+    parser.add_argument("--quartic-strength", type=float, default=0)
+    parser.add_argument("--no-score", action="store_true", help="disable score actions")
+    parser.add_argument(
+        "--hide-archives",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="archive visibility ablation",
+    )
+    parser.add_argument(
+        "--homogeneous",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="use configured latency and measurement time for every player",
+    )
+    parser.add_argument(
+        "--unit-directions", action="store_true", help="normalize measured directions"
+    )
+    parser.add_argument(
+        "--dropout-mean",
+        type=float,
+        help="mean exponential player departure time in seconds; disabled by default",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     parser.add_argument("--threads", type=int, default=1)
@@ -498,6 +689,7 @@ def main():
         )
         < 1
         or args.bc_episodes < 0
+        or (args.dropout_mean is not None and args.dropout_mean <= 0)
         or not 0 < args.gamma <= 1
         or not 0 <= args.gae_lambda <= 1
         or not np.isfinite(args.learning_rate)
@@ -509,17 +701,37 @@ def main():
     torch.set_num_threads(args.threads)
     torch.manual_seed(args.seed)
     device = args.device
-    config = Config(dimension=args.dimension, duration=args.duration)
+    config = Config(
+        dimension=args.dimension,
+        duration=args.duration,
+        measurement_time=args.measurement_time,
+        latency=args.latency,
+        batch_max=args.batch_max,
+        notebook_size=args.notebook_size,
+        step_max=args.step_max,
+        condition=args.condition,
+        spread=args.spread,
+        curvature_jitter=args.curvature_jitter,
+        quartic_strength=args.quartic_strength,
+        score_enabled=not args.no_score,
+        unit_directions=args.unit_directions,
+    )
     iteration, next_seed = 0, args.seed
     if args.resume or args.evaluate:
         model, config, checkpoint = load_mappo(args.resume or args.evaluate, device)
         iteration, next_seed = checkpoint["iteration"], checkpoint["next_seed"]
         for key, value in checkpoint["training"].items():
-            if key != "no_communication" or args.no_communication is None:
+            if key == "no_communication" and args.no_communication is not None:
+                continue
+            if key in ("hide_archives", "homogeneous") and getattr(args, key) is not None:
+                continue
+            else:
                 setattr(args, key, value)
     else:
-        model = MAPPO(config.notebook_size, config.batch_max).to(device)
+        model = MAPPO(config.notebook_size + args.players, config.batch_max).to(device)
     args.no_communication = bool(args.no_communication)
+    args.hide_archives = bool(args.hide_archives)
+    args.homogeneous = bool(args.homogeneous)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
     if args.resume:
         optimizer.load_state_dict(checkpoint["optimizer"])
@@ -538,6 +750,9 @@ def main():
             device,
             args.bc_epochs,
             communication=not args.no_communication,
+            dropout_mean=args.dropout_mean,
+            archives_visible=not args.hide_archives,
+            heterogeneous=not args.homogeneous,
         )
         (args.output / "imitation.json").write_text(json.dumps(bc_stats, indent=2) + "\n")
         next_seed += args.bc_episodes
@@ -551,6 +766,9 @@ def main():
             "epochs",
             "episodes_per_update",
             "no_communication",
+            "dropout_mean",
+            "hide_archives",
+            "homogeneous",
         )
     }
     if not args.evaluate:
@@ -565,6 +783,9 @@ def main():
                 args.gamma,
                 args.gae_lambda,
                 communication=not args.no_communication,
+                dropout_mean=args.dropout_mean,
+                archives_visible=not args.hide_archives,
+                heterogeneous=not args.homogeneous,
             )
             next_seed += args.episodes_per_update
             metrics = update(model, optimizer, batch, epochs=args.epochs)
@@ -596,6 +817,9 @@ def main():
         device,
         communication=not args.no_communication,
         deterministic=args.deterministic_evaluation,
+        dropout_mean=args.dropout_mean,
+        archives_visible=not args.hide_archives,
+        heterogeneous=not args.homogeneous,
     )
     (args.output / "evaluation.json").write_text(json.dumps(result, indent=2) + "\n")
     (args.output / "run.json").write_text(
