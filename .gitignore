@@ -1,0 +1,23 @@
+# Python environments and generated files
+.venv/
+__pycache__/
+.ipynb_checkpoints/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Test, lint, and coverage artifacts
+.pytest_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Local settings and secrets
+.env
+.env.*
+!.env.example
+
+# Experiment outputs
+results/
