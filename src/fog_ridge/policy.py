@@ -119,14 +119,24 @@ class ActorCritic(nn.Module):
     def value(self, critic):
         return self.critic(critic).squeeze(-1)
 
-    def act(self, data, actions=None, deterministic=False):
+    def actor_context(self, data):
+        return self.context(data["context"])
+
+    def token_embeddings(self, data):
+        return self.embed(data["tokens"])
+
+    def encode(self, data):
         valid = data["valid"]
-        root = self.context(data["context"])
-        x = torch.cat([root[:, None], self.embed(data["tokens"])], 1)
+        root = self.actor_context(data)
+        x = torch.cat([root[:, None], self.token_embeddings(data)], 1)
         full_valid = torch.cat([torch.ones_like(valid[:, :1]), valid], 1)
         for block in self.blocks:
             x = block(x, full_valid, data["pair"])
-        root, tokens = x[:, 0], x[:, 1:]
+        return x[:, 0], x[:, 1:]
+
+    def act(self, data, actions=None, deterministic=False):
+        valid = data["valid"]
+        root, tokens = self.encode(data)
         queries = self.pointers(root).reshape(-1, 4, root.shape[-1])
         logits = torch.einsum("bhw,bnw->bhn", queries, tokens) / np.sqrt(root.shape[-1])
         direction = valid & ((data["tokens"][:, :, 0] + data["tokens"][:, :, 2]) > 0)

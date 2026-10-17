@@ -48,11 +48,25 @@ class Config:
 
 @dataclass(frozen=True)
 class Action:
-    kind: Literal["measure", "score", "walk", "wait", "delete", "summarize"]
+    kind: Literal[
+        "measure",
+        "score",
+        "walk",
+        "wait",
+        "delete",
+        "summarize",
+        "request",
+        "accept",
+        "reject",
+        "ignore",
+        "disconnect",
+        "continue",
+    ]
     batch: int = 1
     displacement: Vector | None = None
     seconds: float = 1.0
     slots: tuple[int, ...] = ()
+    target: int = -1
 
 
 @dataclass
@@ -63,6 +77,9 @@ class Record:
     direction: Vector | None = None
     value: float | None = None
     batch: int = 0
+    source: int | None = None
+    source_m: float = 0.0
+    source_l: float = 0.0
 
 
 class SoloEnv:
@@ -85,6 +102,8 @@ class SoloEnv:
         self.records: list[Record] = []
         self.pending: Record | None = None
         self.last_measurement = None
+        self.last_direction = None
+        self.last_batch = 0
         self.dashboard = None
         self.dashboard_time = 0.0
         self.next_dashboard = config.dashboard_period
@@ -193,6 +212,8 @@ class SoloEnv:
                 ]
                 value, direction = self.landscape.measure(self.position, indices)
                 self.last_measurement = value
+                self.last_direction = direction.copy()
+                self.last_batch = action.batch
                 self._insert(
                     Record("measure", self.position.copy(), end, direction, value, action.batch)
                 )
@@ -243,7 +264,10 @@ class SoloEnv:
                 [
                     record.kind == "measure",
                     record.kind == "score",
-                    record.kind == "summary",
+                    (
+                        record.kind == "summary"
+                        or (record.kind == "snapshot" and record.direction is not None)
+                    ),
                     self.time - record.time,
                     record.batch,
                     dn,

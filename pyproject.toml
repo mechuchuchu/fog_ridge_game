@@ -11,6 +11,7 @@ dependencies = [
 [project.scripts]
 fog-ridge = "fog_ridge.cli:main"
 fog-ridge-train = "fog_ridge.ppo:main"
+fog-ridge-mappo = "fog_ridge.mappo:main"
 
 [dependency-groups]
 dev = ["pytest>=8", "ruff>=0.9"]

@@ -1,6 +1,6 @@
 # 안개 능선
 
-[룰북 v0.5](fog-ridge-rulebook.md)와 [RL 설계 v0.2](fog-ridge-rl-design.md)를 구현하는 Python 연구 프로젝트다. 현재는 **솔로 참조 시뮬레이터, 스크립트 베이스라인과 PPO 학습**을 구현했다. 다인 교신과 MAPPO는 후속 단계다.
+[룰북 v0.5](fog-ridge-rulebook.md)와 [RL 설계 v0.2](fog-ridge-rl-design.md)를 구현하는 Python 연구 프로젝트다. 현재는 **솔로 PPO와 교신을 포함한 비동기 다인 MAPPO**를 구현했다. 이탈·아카이브와 GPU 환경 벡터화는 후속 단계다.
 
 ```bash
 uv sync
@@ -42,7 +42,7 @@ print(result)
 
 현재 베이스라인은 학습이나 튜닝을 수행하지 않는다. B는 고정이고 학습률은 `lr / (1 + decay * steps)`다. 최고 점수계 기록을 가능한 한 보존하지만 막판 복귀는 아직 구현하지 않았다. 관측의 점수계·대시보드 값도 현재 원시값이며, 학습 단계에서 상대값 정규화를 추가해야 한다.
 
-다음 구현 단계는 솔로 정책 튜닝과 커리큘럼 ① 평가, 이후 다인 이벤트 큐와 교신(요청/수락/403), 이탈·아카이브, GPU 텐서 병렬화다. 비2차 맵, MAPPO, 평가 ablation, 규칙 증류도 아직 구현하지 않았다. 솔로 테스트 통과를 전체 게임이나 커리큘럼 ①의 학습 통과로 간주하지 않는다.
+다음 구현 단계는 교신 정책 튜닝과 커리큘럼 평가, 이탈·아카이브, GPU 텐서 병렬화다. 비2차 맵, 평가 ablation, 규칙 증류도 아직 구현하지 않았다. 솔로 테스트 통과를 전체 게임이나 커리큘럼 ①의 학습 통과로 간주하지 않는다.
 
 ```bash
 uv run ruff check src tests
@@ -81,3 +81,52 @@ PPO clip은 0.2, GAE lambda는 0.95, 기본 gamma는 1이다. gamma는 초당 �
 평가 시드는 `1_000_000 + seed`부터 사용한다. 현재 SGD는 튜닝 전 기준선이다. 짧은 smoke 학습 성공은 성능 우위를 의미하지 않으며, 충분한 시드와 튜닝된 SGD를 상대로 커리큘럼 통과 여부를 별도로 평가해야 한다.
 
 구현 참고: [PPO 논문](https://arxiv.org/abs/1707.06347), [GAE 논문](https://arxiv.org/abs/1506.02438).
+
+## 교신을 포함한 비동기 MAPPO
+
+```bash
+uv run fog-ridge-mappo --players 4 --aggregation min --iterations 20 --output results/mappo-min
+uv run fog-ridge-mappo --players 4 --aggregation mean --iterations 20 --output results/mappo-mean
+uv run fog-ridge-mappo --resume results/mappo-min/checkpoint.pt --iterations 20 --output results/mappo-min
+uv run fog-ridge-mappo --evaluate results/mappo-min/checkpoint.pt --eval-episodes 100 --output results/mappo-eval
+uv run fog-ridge-mappo --evaluate results/mappo-min/checkpoint.pt --no-communication --eval-episodes 100 --output results/mappo-no-comm-eval
+```
+
+교신은 기본 켜짐이다. `--no-communication`은 학습과 평가 모두에서 교신 행동을 마스킹하는 ablation이다. 위의 마지막 두 명령은 같은 평가 시드로 교신 유무를 비교한다. `--iterations`는 재개 시 추가 학습 횟수다. 체크포인트의 인원, 집계, 환경, 할인·GAE, epoch 수, update당 판 수와 optimizer 상태를 복원한다. `--no-communication`을 명시하면 체크포인트의 교신 설정보다 우선한다. CUDA 환경에서는 `PYTHONPATH=src /venv/main/bin/python -m fog_ridge.mappo --device cuda`로 실행할 수 있다.
+
+### 교신 규칙
+
+- 요청·수락·거절·무시는 즉시 처리하고 응답 없는 요청은 5초 뒤 만료된다. 요청은 상대의 측정·점수계·걸음 중에도 도착해 결정을 깨운다. 무시는 현재 작업을 유지하며, 만료 전에는 이후 결정에서 수락·거절할 수 있다.
+- 이미 교신 중이거나 수락 후 걸음을 기다리는 상대에게 요청하면 즉시 403이다. 상대의 busy 상태는 actor 관측이나 요청 대상 마스크로 공개하지 않는다. 수락할 때 두 끝점을 예약하고 경합 요청은 403으로 해제한다.
+- 진행 중인 걸음은 끝까지 완료한 후 세션을 시작한다. 양쪽에 걸음이 있으면 모두 완료될 때까지 기다린다. 스냅샷은 이 **실제 세션 시작 시각**의 위치와 마지막 자기 측정 방향을 고정한다. 아직 측정하지 않은 플레이어의 방향은 없다.
+- 세션 시작 때 진행 중인 점수계를 취소하고 결과를 폐기한다. 측정은 유지한다. 교신 중 새 측정은 가능하고 걸음·점수계는 불가능하다. 세션 길이는 `max(L_a, L_b)`다.
+- 세션 완료 때 고정한 스냅샷을 양쪽 기록장에 넣는다. 세션 중 완료된 측정은 자기 기록장에만 남는다. 스냅샷에는 점수계 값·고도가 포함되지 않는다. 방향과 함께 위치·시각·출처 L/m·측정 B를 보존한다.
+- 어느 쪽이든 끊으면 전달 없이 즉시 양쪽을 해제한다. 진행 중 측정은 계속된다. 교신에 의한 자동 이동이나 맵 교체는 없다.
+- 동일 시각에는 로컬 행동 완료, 대기 세션 시작, 교신 완료, 요청 만료, 대시보드, T 종료 순서로 처리한다. T에 정확히 끝나는 세션은 전달하며 T를 넘는 세션은 전달하지 않는다. 걸음을 기다리는 예약 단계에서도 끊을 수 있다.
+
+측정 도중 스냅샷을 받더라도 측정 완료 시 기존 기록장을 덮어쓰지 않는다. 같은 시각에 여러 기록이 들어오면 대기 큐에 보존하고 삭제·요약 결정을 강제한다. 로컬 작업은 완료 시각에 그 작업의 변경분만 반영한다. 미래 결과 계산용 복사본의 위치·경사는 actor/critic에 노출하지 않는다.
+
+### 정책과 학습
+
+공유 actor는 자기 기록장과 공개 L/m·대시보드, 자기 요청·교신 상태를 본다. 공개 플레이어 토큰에는 본인 표시와 나에게 온 요청, 내가 보낸 요청, 내 상대 여부가 포함된다. 전원 공통 busy 상태나 절대 플레이어 ID는 주지 않는다. 받은 스냅샷의 방향·위치는 기존 걸음 포인터로 선택할 수 있고, 출처 L/m은 별도 토큰 특징으로 인코딩한다.
+
+행동 헤드는 기존 로컬 행동에 `request`, `accept`, `reject`, `ignore`, `disconnect`, `continue`를 추가한다. 요청·응답은 플레이어 토큰 포인터로 대상을 고르며 해당 행동의 포인터 log probability만 PPO 확률비에 포함한다. `continue`는 작업을 취소하지 않고 다음 사건을 기다리는 제어 응답이다. 알림 도착 시 로컬 작업이 진행 중이면 요청 응답·끊기·강제 기록장 관리만 할 수 있다. 측정이나 이동을 중복 시작할 수 없다.
+
+중앙 critic은 전원의 실제 gap, 중심까지 거리, 경사·곡률 통계, 로컬 작업 남은 시간, focal 플레이어와의 거리, 교신 여부·남은 시간으로 set-attention을 계산한다. actor와 파라미터를 공유하지 않는다.
+
+각 플레이어의 결정부터 그 플레이어의 다음 결정까지 팀 잠재함수 변화와 실제 경과 시간을 누적한다. 요청·응답·교신 종료 알림도 결정 구간을 나눈다. 종료 시 열린 구간을 닫고 에이전트별 GAE를 계산한 뒤 공유 PPO minibatch로 합친다. 기본 `gamma=1`에서 각 플레이어 보상 합은 팀 잠재함수의 전체 변화와 같다.
+
+기본 초기화는 주기적 gossip을 하는 SGD 스크립트의 행동 복제다(`--bc-episodes 4 --bc-epochs 20`). 스크립트는 요청·수락·교신 중 측정을 시연하고, 받은 방향·위치를 얼마나 쓸지는 이후 MAPPO가 학습한다. 스크립트는 상대의 비공개 위치나 방향으로 교신 대상을 선택하지 않는다. `--bc-episodes 0`이면 무작위 초기화부터 시작한다. 평가의 비교 대상은 같은 맵·시작점·L/m·초기 샘플링 시드를 쓰는 독립 SGD 팀이다. MAPPO 평가는 기본적으로 시드별로 재현 가능한 정책 샘플링을 사용하며 학습 RNG를 소비하지 않는다. `--deterministic-evaluation`을 붙이면 argmax로 평가한다. argmax에서는 낮은 확률의 교신 행동이 선택되지 않을 수 있으므로 두 평가 방식을 구분한다.
+
+### 출력과 제한
+
+- `checkpoint.pt`: 모델·optimizer·RNG·환경·학습 설정. 교신 모델은 별도 `communication_version=1`로 저장한다. 이전 교신 없는 MAPPO 체크포인트는 헤드와 관측 크기가 달라 새 모델로 학습을 시작해야 한다. 솔로 PPO 형식은 유지한다.
+- `imitation.json`: 모방 데이터 생성 중의 교신 통계.
+- `train.jsonl`: 학습 loss·KL·점수와 요청·403·수락·거절·만료·교신 시작/완료·끊기·점수계 취소·스냅샷·중첩 측정 횟수.
+- `episodes.jsonl`: 학습 rollout별 시드·플레이어 L/m·gap·결정 횟수·교신 사건 목록. 누가 누구와 언제 교신했는지 학습 중에도 분석할 수 있다.
+- `evaluation.json`: 시드별 MAPPO/SGD gap, 교신 통계와 요청·응답·세션 시작/종료 사건 목록. 세션 사건의 끝점으로 교신 그래프를 구성할 수 있다.
+- `run.json`: 실행 및 복원된 환경·학습 설정.
+
+아직 이탈·아카이브, 거짓말 변형, GRU, 여러 기록의 soft 가중합, 비2차 맵, GPU 환경 벡터화는 없다. 현재는 인원 고정 배치의 CPU 참조 환경이며 네트워크 자체는 다른 인원과 차원에서도 실행할 수 있다. 짧은 실행으로 교신이 학습 성능을 개선한다고 판단하지 않는다. 요청·403 등은 규칙대로 시간이 0이므로 정책이 이를 끝없이 반복하면 결정 횟수 상한 오류로 중단한다. 별도 cooldown이나 가짜 시간 비용을 추가하지 않는다.
+
+MAPPO 참고: [The Surprising Effectiveness of PPO in Cooperative, Multi-Agent Games](https://arxiv.org/abs/2103.01955).

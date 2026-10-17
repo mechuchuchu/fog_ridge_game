@@ -193,10 +193,14 @@ def evaluate(model, config, seeds, device):
     }
 
 
-def save_checkpoint(path, model, optimizer, config, iteration, next_seed, training=None):
+def save_checkpoint(
+    path, model, optimizer, config, iteration, next_seed, training=None, algorithm="ppo", extra=None
+):
     torch.save(
         {
+            **(extra or {}),
             "format_version": 1,
+            "algorithm": algorithm,
             "training": training or {},
             "model_settings": model.settings,
             "model": model.state_dict(),
@@ -213,8 +217,8 @@ def save_checkpoint(path, model, optimizer, config, iteration, next_seed, traini
 
 def load_checkpoint(path, device="cpu"):
     checkpoint = torch.load(path, map_location=device, weights_only=True)
-    if checkpoint["format_version"] != 1:
-        raise ValueError("unsupported checkpoint version")
+    if checkpoint["format_version"] != 1 or checkpoint.get("algorithm", "ppo") != "ppo":
+        raise ValueError("expected a supported solo PPO checkpoint")
     model = ActorCritic(**checkpoint["model_settings"]).to(device)
     model.load_state_dict(checkpoint["model"])
     return model, Config(**checkpoint["config"]), checkpoint
